@@ -48,16 +48,51 @@
 
 ## Install
 
-### Option 1: With Claude Code (fast)
+### Option 1: With an AI agent (fast)
 
-Copy this text. Paste it into Claude Code on your Linux computer.
+Use Claude Code, Codex, or another AI agent that can run terminal commands. Copy this text. Paste it into the agent.
 
 ```text
 Install SAR Watch from https://github.com/abdulrahman-se/saudi-ticket-alert on my Linux computer.
-Follow the "Install in the terminal" steps in its README for my Linux. Ask me before you run sudo.
+Download its install.sh, read it, and tell me in short what it does. Then run: sh install.sh
+Do not run sudo yourself. If the script shows sudo commands, give them to me. I run them in my terminal.
 ```
 
-### Option 2: Install in the terminal
+### Option 2: In the terminal (one command)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abdulrahman-se/saudi-ticket-alert/main/install.sh | sh
+```
+
+No `curl` (for example on Ubuntu)? Use this:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/abdulrahman-se/saudi-ticket-alert/main/install.sh | sh
+```
+
+The script does these steps:
+
+1. It finds your Linux: Fedora, Ubuntu, Debian, Arch, and Linux that comes from them (Linux Mint, Pop!_OS, Manjaro and more).
+2. It checks Python, the GTK parts, Chrome or Chromium, and the top-bar icon support.
+3. It shows what is missing. It asks you before it uses `sudo`.
+4. It installs SAR Watch for your user only.
+
+Then open **SAR Watch** from your app menu. It also starts when you log in.
+
+<details>
+<summary><b>Read the script before you run it (safer)</b></summary>
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/abdulrahman-se/saudi-ticket-alert/main/install.sh
+less install.sh            # read it
+sh install.sh --check      # check only, change nothing
+sh install.sh
+```
+
+</details>
+
+<details>
+<summary><b>Install by hand (no script)</b></summary>
 
 **1. Install what it needs.** Copy the box for your Linux.
 
@@ -65,11 +100,6 @@ Ubuntu:
 
 ```bash
 sudo apt install git python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7
-```
-
-On Ubuntu, also install [Google Chrome](https://www.google.com/chrome/), or Chromium:
-
-```bash
 sudo snap install chromium
 ```
 
@@ -99,11 +129,11 @@ cd saudi-ticket-alert
 python3 sar_watch.py --install
 ```
 
-**3. Open "SAR Watch"** from your app menu. It also starts when you log in.
+**GNOME:** install the extension "AppIndicator and KStatusNotifierItem Support". Ubuntu has it already. KDE, Xfce and Cinnamon need nothing.
 
-Tested on Ubuntu 24.04, Debian 12, Fedora 43, Arch Linux and Fedora 43 GNOME.
+</details>
 
-> **GNOME:** install the extension "AppIndicator and KStatusNotifierItem Support". Ubuntu has it already. KDE, Xfce and Cinnamon need nothing.
+Tested on Fedora 43 GNOME (real computer), and Ubuntu 24.04, Debian 12, Fedora 43 and Arch Linux (Docker).
 
 ## Use
 
@@ -165,11 +195,13 @@ python3 ~/.local/share/sar-watch/sar_watch.py --update
 - It sends only the day, the route and the train times to your phone.
 - It uses no extra Python packages. All parts come from your Linux system.
 - Updates come only from this GitHub repo, over HTTPS, and only when you click.
+- `install.sh` uses only the package repositories of your Linux. It adds no repositories and no keys. It asks before it uses `sudo`. It does not run as root.
 
 ## Troubleshooting
 
 | Problem | Do this |
 |---|---|
+| Something is missing. | Run `sh install.sh --check`. It shows what is missing. |
 | I cannot see the train icon. | GNOME: install the extension "AppIndicator and KStatusNotifierItem Support". Then log out and log in. |
 | The icon has an orange dot. | The SAR site was slow. Do nothing. SAR Watch tries again. |
 | "Chrome or Chromium not found". | Install Google Chrome or Chromium (see [Install](#install)). |
