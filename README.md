@@ -17,6 +17,7 @@
 - [Install](#install)
 - [Use](#use)
 - [Phone alerts](#phone-alerts-optional)
+- [Server (SSH, no desktop)](#server-ssh-no-desktop)
 - [Update](#update)
 - [How it works](#how-it-works)
 - [Safety](#safety)
@@ -149,6 +150,8 @@ python3 sar_watch.py --once 2026-11-26 --route RIY-QSM   # one check
 python3 sar_watch.py --stations                          # station codes
 ```
 
+For a server, see [Server (SSH, no desktop)](#server-ssh-no-desktop).
+
 ## Phone alerts (optional)
 
 1. Install **ntfy** on your phone (App Store or Google Play).
@@ -157,9 +160,37 @@ python3 sar_watch.py --stations                          # station codes
 4. In SAR Watch, select **Send to iPhone or Android**.
 5. Click **Send test**.
 
-Phone alerts come only when your computer is on and SAR Watch runs.
+Phone alerts come only when your computer is on and SAR Watch runs. For alerts all the time, use a [server](#server-ssh-no-desktop).
 
 Keep your topic secret. A person who knows it can read your alerts.
+
+## Server (SSH, no desktop)
+
+Use a server that is on all the time. Then alerts come also when your computer is off.
+
+**1. Install.** On the server, type:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/abdulrahman-se/saudi-ticket-alert/main/install.sh | sh -s -- --server
+```
+
+It installs no desktop parts. Then it asks you questions: From, To, day, train times and phone alerts. At the end, it asks you to start the background service. Type `y`.
+
+**2. Use these commands:**
+
+| Command | What it does |
+|---|---|
+| `sar-watch --setup` | Change the trip or the phone alerts. The service uses the new settings at once. |
+| `sar-watch --status` | Show the settings, the service and the last check. |
+| `journalctl --user -u sar-watch -f` | Show the live log. Press Ctrl+C to stop. |
+| `sar-watch --service off` | Stop the background service and remove it. |
+| `sar-watch --run` | Watch in this terminal, with no service. |
+
+**Same alerts as your computer:** in `--setup`, type the phone topic of your computer. Then both send to the same ntfy topic.
+
+**After you log out:** the service must keep running. If `--service` shows a `sudo loginctl enable-linger` command, run it one time.
+
+If the `sar-watch` command is not found, use `~/.local/bin/sar-watch`.
 
 ## Update
 
@@ -175,6 +206,8 @@ From a terminal:
 python3 ~/.local/share/sar-watch/sar_watch.py --update
 ```
 
+On a server, the update restarts the background service.
+
 ## How it works
 
 1. It opens the public SAR page in a hidden Chrome or Chromium.
@@ -183,14 +216,14 @@ python3 ~/.local/share/sar-watch/sar_watch.py --update
 4. It checks again.
 5. After an error, it waits longer: 2, 4, 8, then 15 minutes at most.
 
-> **Your computer must be on.** SAR Watch checks from your computer. If the computer is off or asleep, it does not check, and no alert comes (not on the computer, not on the phone).
+> **Your computer must be on.** SAR Watch checks from your computer. If the computer is off or asleep, it does not check, and no alert comes (not on the computer, not on the phone). For alerts all the time, use a [server](#server-ssh-no-desktop).
 
 ## Safety
 
 - It reads only the public SAR page. It does not log in. It does not book.
 - It does not use SAR's private API. It does not go around any security.
 - It checks slowly: one check per minute or less.
-- It has no server, no open ports and no passwords.
+- It opens no ports. It has no passwords. The server mode runs as your user, not as root.
 - Your settings are private files (mode 600).
 - It sends only the day, the route and the train times to your phone.
 - It uses no extra Python packages. All parts come from your Linux system.

@@ -10,6 +10,9 @@
 #   sh install.sh --check      check only, change nothing
 #   sh install.sh              check, ask, install
 #
+# Server with no desktop (SSH): add --server. It installs no GTK parts.
+#   curl -fsSL https://raw.githubusercontent.com/abdulrahman-se/saudi-ticket-alert/main/install.sh | sh -s -- --server
+#
 # What it does
 #   1. It finds your Linux and its package manager (dnf, apt or pacman).
 #   2. It checks Python 3.11+, the GTK parts for Python, Chrome or Chromium,
@@ -129,6 +132,7 @@ SAR Watch installer for Linux
 
   sh install.sh           check your system, ask, then install
   sh install.sh --check   only check and show the commands (change nothing)
+  sh install.sh --server  for a server with no desktop (SSH): no GTK parts
   sh install.sh --yes     do not ask (for scripts and tests)
 
 It asks before it uses sudo. It installs SAR Watch for your user only.
@@ -197,7 +201,9 @@ check_all() {
   if have python3; then
     if PY_VER=$(python3 -I -c "$PY_VERSION" 2>/dev/null); then PY_OK=1; fi
   fi
-  if [ "$PY_OK" = 1 ]; then
+  if [ "$SERVER" = 1 ]; then
+    GTK_MISSING=''
+  elif [ "$PY_OK" = 1 ]; then
     GTK_MISSING=$(python3 -I -c "$PY_GTK" 2>/dev/null) || GTK_MISSING="GTK parts"
   else
     GTK_MISSING="needs Python first"
@@ -205,6 +211,7 @@ check_all() {
   for b in ${SAR_WATCH_BROWSER-} $BROWSERS; do
     if have "$b"; then BROWSER=$b; break; fi
   done
+  [ "$SERVER" != 1 ] || return 0
   case ":${XDG_CURRENT_DESKTOP-}:" in
     *GNOME*)
       EXT_STATE=missing
@@ -228,14 +235,15 @@ show_checks() {
   if [ "$PY_OK" = 1 ]; then ok "Python $PY_VER"
   elif [ -n "$PY_VER" ]; then need "Python 3.11 or newer (this system has $PY_VER)"
   else need "Python 3.11 or newer"; fi
-  if [ -z "$GTK_MISSING" ]; then ok "GTK 3, AppIndicator and libnotify for Python"
+  if [ "$SERVER" = 1 ]; then skip "GTK parts and top-bar icon: not needed on a server"
+  elif [ -z "$GTK_MISSING" ]; then ok "GTK 3, AppIndicator and libnotify for Python"
   else need "GTK 3, AppIndicator and libnotify for Python ($GTK_MISSING)"; fi
   if [ -n "$BROWSER" ]; then ok "Browser: $BROWSER"; else need "Chrome or Chromium"; fi
   case $EXT_STATE in
     on)      ok "Top-bar icon: GNOME extension is on" ;;
     off)     need "Top-bar icon: turn on the GNOME extension \"$EXT_NAME\"" ;;
     missing) need "Top-bar icon: GNOME extension \"$EXT_NAME\"" ;;
-    na)      skip "Top-bar icon: not GNOME, no check" ;;
+    na)      [ "$SERVER" = 1 ] || skip "Top-bar icon: not GNOME, no check" ;;
   esac
   say ""
 }
@@ -243,10 +251,11 @@ show_checks() {
 # Sets PKGS (sudo packages), BROWSER_VIA (pm, snap or empty) and EXT_ENABLE.
 plan() {
   PKGS='' BROWSER_VIA='' EXT_ENABLE=0 CANNOT=''
-  if [ "$PY_OK" != 1 ] || [ -n "$GTK_MISSING" ]; then
-    if [ -z "$PM" ]; then CANNOT="Python 3.11+, PyGObject, GTK 3, Ayatana AppIndicator 3, libnotify"; fi
-    PKGS=$GTK_PKGS
-    if [ "$PY_OK" != 1 ]; then PKGS="$PY_PKG $PKGS"; fi
+  if [ "$PY_OK" != 1 ]; then PKGS=$PY_PKG; fi
+  if [ -n "$GTK_MISSING" ]; then PKGS="$PKGS $GTK_PKGS"; fi
+  if [ -z "$PM" ] && [ -n "$PKGS" ]; then
+    CANNOT="Python 3.11+"
+    if [ "$SERVER" != 1 ]; then CANNOT="$CANNOT, PyGObject, GTK 3, Ayatana AppIndicator 3, libnotify"; fi
   fi
   if [ "$EXT_STATE" = missing ] && [ -n "$PM" ]; then PKGS="$PKGS gnome-shell-extension-appindicator"; fi
   if [ "$EXT_STATE" = missing ] || [ "$EXT_STATE" = off ]; then EXT_ENABLE=1; fi
@@ -310,13 +319,44 @@ install_app() {
   out=$(python3 -I "$TMP_DIR/sar_watch.py" --install 2>&1) || { say "$out" >&2; die "The install step failed."; }
 }
 
+service_active() {
+  have systemctl && systemctl --user is-active --quiet sar-watch.service 2>/dev/null
+}
+
+restart_service() {
+  if systemctl --user restart sar-watch.service 2>/dev/null; then
+    say "The background service uses the new version now."
+  fi
+}
+
+finish_server() {
+  cmd="$HOME/.local/bin/sar-watch"
+  if have sar-watch; then cmd=sar-watch; fi
+  say "${G}Done.${N} SAR Watch is installed for a server (no desktop)."
+  if [ -z "$BROWSER" ]; then
+    warn "No Chrome or Chromium. SAR Watch needs one to check the trains."
+  fi
+  if service_active; then
+    restart_service
+    say "Change the trip: $cmd --setup    Status: $cmd --status"
+  elif [ "$HAS_TTY" = 1 ] && [ "$ASSUME_YES" != 1 ]; then
+    say "Now choose your trip and the phone alerts."
+    say ""
+    "$cmd" --setup </dev/tty || say "Run it again later: $cmd --setup"
+  else
+    say "Next: $cmd --setup"
+  fi
+}
+
 main() {
   colors
-  CHECK_ONLY=0 ASSUME_YES=0 RELOGIN=0
+  CHECK_ONLY=0 ASSUME_YES=0 RELOGIN=0 SERVER=0
+  SERVER_ARG=''
   for arg in "$@"; do
     case $arg in
       --check)    CHECK_ONLY=1 ;;
       --yes|-y)   ASSUME_YES=1 ;;
+      --server)   SERVER=1 SERVER_ARG=' --server' ;;
       --help|-h)  usage; return 0 ;;
       *)          die "Unknown option: $arg. See: sh install.sh --help" ;;
     esac
@@ -329,6 +369,10 @@ main() {
   detect_os
   say "${B}SAR Watch installer${N}"
   say "System: $OS_NAME${PM:+, $PM}"
+  if [ "$SERVER" = 1 ]; then say "Mode: server (no desktop)"
+  elif [ -z "${DISPLAY-}${WAYLAND_DISPLAY-}" ] && [ -n "${SSH_CONNECTION-}" ]; then
+    say "Tip: no desktop found. For a server, use: sh install.sh --server"
+  fi
   say ""
   check_all
   show_checks
@@ -375,7 +419,7 @@ main() {
   else
     if [ "$CHECK_ONLY" = 1 ]; then
       if [ "$EXT_ENABLE" = 1 ]; then say "Ready. It will turn on the GNOME extension (no sudo)."; exit 2; fi
-      say "Ready. Nothing is missing. Run: sh install.sh"
+      say "Ready. Nothing is missing. Run: sh install.sh${SERVER_ARG}"
       exit 0
     fi
   fi
@@ -384,12 +428,18 @@ main() {
   install_app
 
   say ""
+  if [ "$SERVER" = 1 ]; then
+    finish_server
+    return 0
+  fi
   say "${G}Done.${N} Open \"SAR Watch\" from your app menu. It also starts when you log in."
   if [ "$RELOGIN" = 1 ]; then say "${B}Log out and log in one time.${N} Then the train icon shows in the top bar."; fi
   if [ -z "$BROWSER" ]; then
     warn "No Chrome or Chromium. SAR Watch needs one to check the trains. Install Google Chrome: https://www.google.com/chrome/"
   fi
-  if have pgrep && pgrep -u "$(id -u)" -f "sar-watch/sar_watch.py" >/dev/null 2>&1; then
+  if service_active; then
+    restart_service
+  elif have pgrep && pgrep -u "$(id -u)" -f "sar-watch/sar_watch.py" >/dev/null 2>&1; then
     say "SAR Watch is open now. To use the new version: click Quit in its menu, then open it again."
   fi
 }

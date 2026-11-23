@@ -24,6 +24,11 @@ Terminal use:
   sar_watch.py --uninstall         remove the app, its settings and its cache
   sar_watch.py --test-phone        send a test alert to the iPhone
   sar_watch.py --update            update from GitHub (asks first)
+Server (no desktop, for SSH). After --install, the short command is "sar-watch":
+  sar-watch --setup                choose the trip and phone alerts (questions)
+  sar-watch --run                  watch in this terminal (no desktop)
+  sar-watch --service [off]        run in the background, also after a restart
+  sar-watch --status               show the settings and the last check
 """
 import argparse
 import datetime as dt
@@ -31,6 +36,7 @@ import fcntl
 import importlib
 import json
 import os
+import pwd
 import random
 import re
 import secrets
@@ -44,7 +50,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlencode
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 APP_ID = "sar-watch"
 APP_NAME = "SAR Watch"
 _HOME = os.path.expanduser("~")
@@ -58,6 +64,9 @@ SNAP_PROFILE_DIR = os.path.join(_HOME, "snap", "chromium", "common", APP_ID)  # 
 ICON_DIR = os.path.join(DATA_DIR, "icons")
 APPS_DIR = os.path.join(_HOME, ".local", "share", "applications")
 AUTOSTART_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or _HOME + "/.config", "autostart")
+SYSTEMD_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or _HOME + "/.config", "systemd", "user")
+BIN_DIR = os.path.join(_HOME, ".local", "bin")
+SERVICE = f"{APP_ID}.service"
 SCRIPT = os.path.realpath(__file__)
 NTFY_URL = "https://ntfy.sh/"
 UPDATE_REPO = "abdulrahman-se/saudi-ticket-alert"
@@ -493,12 +502,27 @@ def install():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(entry)
+    link = os.path.join(BIN_DIR, APP_ID)
+    if _our_link(link):
+        os.remove(link)
+    if not os.path.lexists(link):           # never replace a file that is not ours
+        os.makedirs(BIN_DIR, exist_ok=True)
+        os.symlink(target, link)
     print(f"Installed: {target}")
     print("Open 'SAR Watch' from your app menu. It also starts at login.")
+    print(f"Terminal command: {APP_ID}  (if not found, use {link})")
+
+
+def _our_link(link):
+    return os.path.islink(link) and os.readlink(link) == installed_path()
 
 
 def uninstall(assume_yes=False):
-    paths = [p for p in [*_launchers(), DATA_DIR, CONF_DIR, CACHE_DIR, SNAP_PROFILE_DIR] if os.path.exists(p)]
+    unit = os.path.join(SYSTEMD_DIR, SERVICE)
+    link = os.path.join(BIN_DIR, APP_ID)
+    paths = [p for p in [*_launchers(), unit, DATA_DIR, CONF_DIR, CACHE_DIR, SNAP_PROFILE_DIR] if os.path.exists(p)]
+    if _our_link(link):
+        paths.insert(0, link)
     if not paths:
         print("Nothing to remove.")
         return 0
@@ -509,6 +533,8 @@ def uninstall(assume_yes=False):
         if input("Remove them? [y/N] ").strip().lower() != "y":
             print("Nothing removed.")
             return 1
+    if unit in paths and shutil.which("systemctl"):
+        _systemctl("disable", "--now", SERVICE)
     for p in paths:
         if os.path.isdir(p) and not os.path.islink(p):
             shutil.rmtree(p, ignore_errors=True)
@@ -534,6 +560,300 @@ def run_once(date_text, route):
     for t in res["trips"]:
         print(f"  {t['dep']} → {t['arr']}  train {t['train']:>3}  {'SEATS' if t['available'] else 'full'}")
     return 0 if any(t["available"] for t in res["trips"]) else 1
+
+# --------------------------------------------------------------------------- server (no desktop, for SSH)
+
+DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _to_journal():
+    """True when the output goes to the systemd journal (it adds its own time)."""
+    try:
+        st = os.fstat(sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        return False
+    return os.environ.get("JOURNAL_STREAM") == f"{st.st_dev}:{st.st_ino}"
+
+
+def log(text):
+    stamp = "" if _to_journal() else f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  "
+    print(stamp + text, flush=True)
+
+
+def parse_day(text, today=None):
+    """'2026-11-26', or a day name ('thu', 'Thursday') for the next such day. Raises ValueError."""
+    today = today or dt.date.today()
+    t = text.strip().lower()
+    if len(t) >= 3 and t.isalpha() and t[:3] in DAY_NAMES:
+        return today + dt.timedelta(days=(DAY_NAMES.index(t[:3]) - today.weekday()) % 7)
+    d = dt.date.fromisoformat(t)
+    if d < today:
+        raise ValueError("That day has passed.")
+    return d
+
+
+def passed_date():
+    """The saved day when it is in the past, else None."""
+    try:
+        with open(CONF_FILE, encoding="utf-8") as f:
+            d = dt.date.fromisoformat(str(json.load(f).get("date")))
+    except (OSError, ValueError, AttributeError):
+        return None
+    return d if d < dt.date.today() else None
+
+
+def trips_line(trips, times):
+    if not trips:
+        return "No trains open for this day yet."
+    mine = [t for t in trips if not times or t["dep"] in times]
+    if not mine:
+        return f"No train at {', '.join(times)} on this day."
+    return " · ".join(f"{t['dep']} {'SEATS' if t['available'] else 'full'}" for t in mine)
+
+
+def _state_file():
+    return os.path.join(CACHE_DIR, "last.json")
+
+
+def run_headless(max_checks=None, sleep=time.sleep):
+    """Watch with no desktop. One log line per check. Alerts go to the phone (ntfy)."""
+    log(f"SAR Watch {__version__} started (no desktop).")
+    key, alerted, errors, told, checks = None, set(), 0, None, 0
+    while max_checks is None or checks < max_checks:
+        cfg = load_config()                     # read every time, so 'sar-watch --setup' changes apply
+        old = passed_date()
+        if old:
+            if told != old:
+                told = old
+                msg = f"The day {old:%a %d %b} has passed. Choose a new day: sar-watch --setup"
+                log(msg)
+                if cfg["phone"]:
+                    send_phone("SAR Watch", msg)
+            checks += 1
+            sleep(600)
+            continue
+        if (cfg["route"], cfg["date"]) != key:
+            key, alerted, errors = (cfg["route"], cfg["date"]), set(), 0
+            log(f"Watching {route_label(cfg['route'])} · {cfg['date']:%a %d %b %Y} · trains: "
+                f"{', '.join(cfg['times']) or 'all'} · phone alerts: "
+                f"{'on' if cfg['phone'] else 'OFF (turn on: sar-watch --setup)'}")
+        res = check(cfg["route"], cfg["date"])
+        checks += 1
+        if res["ok"]:
+            errors = 0
+            text = trips_line(res["trips"], cfg["times"])
+            got = wanted(res["trips"], cfg["times"])
+            new = [t for t in got if t["dep"] not in alerted]
+            alerted = {t["dep"] for t in got}
+            if new and cfg["phone"]:
+                err = send_phone("🚆 SAR: seats available!", alert_text(cfg, new),
+                                 build_url(cfg["route"], cfg["date"]))
+                if err:
+                    alerted -= {t["dep"] for t in new}      # try again at the next check
+                text += " · phone alert " + (f"FAILED ({err})" if err else "sent")
+        else:
+            errors += 1
+            text = "Check failed: " + res["error"]
+            if errors == 2:   # stale browser data can break the page; start fresh
+                reset_browser_data()
+        log(text)
+        _write_private(_state_file(), json.dumps(
+            {"at": res["at"].isoformat(timespec="seconds"), "text": text}))
+        if max_checks is None or checks < max_checks:
+            sleep(next_delay(cfg["interval"], errors))
+    return 0
+
+
+def _ask(prompt, now):
+    return input(f"{prompt} [{now}]: ").strip()
+
+
+def _yes(prompt, default=True):
+    answer = input(f"{prompt} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+    return default if not answer else answer in ("y", "yes")
+
+
+def find_station(text):
+    """A number from the list, a code (QSM) or a name (Qassim). None when unknown."""
+    codes = list(STATIONS)
+    t = text.strip()
+    if t.isdigit() and 1 <= int(t) <= len(codes):
+        return codes[int(t) - 1]
+    if t.upper() in STATIONS:
+        return t.upper()
+    names = [c for c, (name, _line) in STATIONS.items() if name.lower() == t.lower()]
+    return names[0] if len(names) == 1 else None
+
+
+def setup():
+    """Questions in the terminal (for SSH). Enter keeps the value in [brackets]."""
+    cfg = load_config()
+    codes = list(STATIONS)
+    print(f"SAR Watch {__version__} setup. Press Enter to keep the value in [brackets].\n")
+    for line, line_name in LINES.items():
+        print(f"{line_name}:  " + "   ".join(f"{i}) {name} ({code})" for i, (code, (name, ln))
+                                            in enumerate(STATIONS.items(), 1) if ln == line))
+    print()
+
+    def label(code):
+        return f"{codes.index(code) + 1} {STATIONS[code][0]}"
+
+    dep, arr = split_route(cfg["route"])
+    while True:
+        answer = _ask("From", label(dep))
+        pick = find_station(answer) if answer else dep
+        if pick:
+            dep = pick
+            break
+        print("  Type a number from the list, for example 1.")
+    if not valid_route(f"{dep}-{arr}"):
+        arr = next(c for c in codes if c != dep and STATIONS[c][1] == STATIONS[dep][1])
+    while True:
+        answer = _ask("To", label(arr))
+        pick = find_station(answer) if answer else arr
+        if pick and valid_route(f"{dep}-{pick}"):
+            arr = pick
+            break
+        print(f"  Choose a station on the {LINES[STATIONS[dep][1]]}, not {STATIONS[dep][0]}.")
+    date = cfg["date"]
+    while True:
+        answer = _ask("Day (YYYY-MM-DD, or a day name like thu)", f"{date:%Y-%m-%d %a}")
+        try:
+            date = parse_day(answer) if answer else date
+            break
+        except ValueError:
+            print("  Use a day like 2026-11-26 or thu. The day must be today or later.")
+    times = cfg["times"]
+    while True:
+        answer = _ask("Train times, for example 17:30 (all = every train)", ", ".join(times) or "all")
+        if not answer or answer.lower() == "all" or parse_times(answer):
+            times = times if not answer else [] if answer.lower() == "all" else parse_times(answer)
+            break
+        print("  Use HH:MM, for example 17:30. Put a comma between two times.")
+    interval = cfg["interval"]
+    while True:
+        answer = _ask(f"Seconds between checks ({MIN_INTERVAL}-{MAX_INTERVAL})", interval)
+        try:
+            interval = clamp_interval(answer) if answer else interval
+            break
+        except ValueError:
+            print("  Type a number, for example 60.")
+    phone = _yes("Send alerts to your phone with the free ntfy app?")
+    if phone:
+        print("  In the ntfy app: tap +, type the topic, tap Subscribe.")
+        print("  To get the same alerts as another computer, type its topic here.")
+        while True:
+            answer = _ask("  Phone topic", phone_topic())
+            if not answer or set_phone_topic(answer):
+                break
+            print("  Use 8 to 64 letters, numbers, - or _.")
+    cfg.update(route=f"{dep}-{arr}", date=date, times=times, interval=interval, phone=phone)
+    save_config(cfg)
+    print(f"\nSaved: {route_label(cfg['route'])} · {date:%a %d %b %Y} · trains: {', '.join(times) or 'all'}"
+          f" · every {interval} s · phone: {'on' if phone else 'off'}")
+    if phone and _yes("Send a test alert to your phone now?"):
+        err = send_phone("SAR Watch test", "It works. Seat alerts will come here.")
+        print("  Sent. Look at your phone." if not err else "  Failed: " + err)
+    state = service_state()
+    if state == "active":
+        _systemctl("restart", SERVICE)
+        print("The background service uses the new settings now.")
+    elif state != "none" and _yes("Run it in the background now, and after each restart?"):
+        return service("on")
+    else:
+        print(f"Start it with: {APP_ID} --run   (background: {APP_ID} --service)")
+    return 0
+
+
+def _systemctl(*args):
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)  # nosec B603 B607
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+def _user_systemd():
+    return bool(shutil.which("systemctl")) and _systemctl("show-environment")[0]
+
+
+def service_state():
+    """'active', 'inactive', 'failed', ... or 'none' when systemd for this user is not there."""
+    if not _user_systemd():
+        return "none"
+    r = subprocess.run(["systemctl", "--user", "is-active", SERVICE],  # nosec B603 B607
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
+def service_unit(target):
+    return ("[Unit]\nDescription=SAR Watch: SAR train seat alerts\n\n[Service]\n"
+            f'ExecStart="{sys.executable or "/usr/bin/python3"}" -I "{target}" --run\n'
+            "Restart=on-failure\nRestartSec=60\nNice=10\n\n[Install]\nWantedBy=default.target\n")
+
+
+def _user_name():
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
+def linger_on():
+    return os.path.exists(f"/var/lib/systemd/linger/{_user_name()}")
+
+
+def service(action="on"):
+    """Run --run as a systemd user service (no root), or stop and remove it."""
+    if not _user_systemd():
+        print("systemd for your user is not there. Log in with SSH as this user (not with su or sudo),\n"
+              f"then try again. Or run it in tmux or screen: {APP_ID} --run")
+        return 2
+    unit = os.path.join(SYSTEMD_DIR, SERVICE)
+    if action == "off":
+        _systemctl("disable", "--now", SERVICE)
+        if os.path.exists(unit):
+            os.remove(unit)
+        _systemctl("daemon-reload")
+        print("The background service is stopped and removed.")
+        return 0
+    if not os.path.exists(installed_path()):
+        install()
+    os.makedirs(SYSTEMD_DIR, exist_ok=True)
+    with open(unit, "w", encoding="utf-8") as f:
+        f.write(service_unit(installed_path()))
+    for args in (("daemon-reload",), ("enable", SERVICE), ("restart", SERVICE)):
+        ok, err = _systemctl(*args)
+        if not ok:
+            print(f"Error: systemctl --user {' '.join(args)}: {err}")
+            return 2
+    print("The background service runs now.")
+    if not linger_on():
+        r = subprocess.run(["loginctl", "--no-ask-password", "enable-linger"],  # nosec B603 B607
+                           capture_output=True, text=True) if shutil.which("loginctl") else None
+        if r is None or r.returncode != 0:
+            print(f"To keep it running after you log out, run one time:\n  sudo loginctl enable-linger {_user_name()}")
+    if linger_on():
+        print("It keeps running after you log out, and it starts after a restart.")
+    print(f"Status: {APP_ID} --status    Logs: journalctl --user -u {APP_ID} -f")
+    return 0
+
+
+def status():
+    cfg = load_config()
+    old = passed_date()
+    day = f"{old:%a %d %b %Y} (passed: run {APP_ID} --setup)" if old else f"{cfg['date']:%a %d %b %Y}"
+    print(f"SAR Watch {__version__}")
+    print(f"Trip:     {route_label(cfg['route'])} · {day}")
+    print(f"Trains:   {', '.join(cfg['times']) or 'all'}")
+    print(f"Checks:   every {cfg['interval']} s (plus or minus 20 %)")
+    print(f"Phone:    {'on · topic ' + phone_topic() if cfg['phone'] else 'off'}")
+    state = service_state()
+    if state != "none":
+        note = "" if state != "active" or linger_on() else \
+            f" (stops when you log out: sudo loginctl enable-linger {_user_name()})"
+        print(f"Service:  {state}{note}")
+    try:
+        with open(_state_file(), encoding="utf-8") as f:
+            last = json.load(f)
+        print(f"Last:     {last['at'].replace('T', ' ')} · {last['text']}")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        print("Last:     no background check yet")
+    return 0
 
 # --------------------------------------------------------------------------- top-bar app
 
@@ -1103,6 +1423,12 @@ def main():
     ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--test-phone", action="store_true", help="send a test alert to the phone (ntfy)")
     ap.add_argument("--update", action="store_true", help="update from GitHub (asks first)")
+    ap.add_argument("--setup", action="store_true", help="server: choose the trip and phone alerts (questions)")
+    ap.add_argument("--run", action="store_true", help="server: watch in this terminal, no desktop")
+    ap.add_argument("--service", nargs="?", const="on", choices=("on", "off"),
+                    help="server: run in the background, also after a restart (off: stop and remove)")
+    ap.add_argument("--status", action="store_true", help="show the settings and the last check")
+    ap.add_argument("--checks", type=int, help=argparse.SUPPRESS)   # tests: stop after N checks
     ap.add_argument("--watch", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="version", version=f"SAR Watch {__version__}")
     ap.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
@@ -1131,8 +1457,25 @@ def main():
             print("Nothing changed.")
             return 1
         print(f"Installed {version_text(version)}: {install_update(text)}")
-        print("Quit SAR Watch and open it again.")
+        if service_state() == "active":
+            _systemctl("restart", SERVICE)
+            print("The background service uses the new version now.")
+        else:
+            print("Quit SAR Watch and open it again.")
         return 0
+    if args.setup or args.run or args.service or args.status:
+        try:
+            if args.setup:
+                return setup()
+            if args.service:
+                return service(args.service)
+            if args.status:
+                return status()
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # stop cleanly; the browser closes too
+            return run_headless(max_checks=args.checks)
+        except (EOFError, KeyboardInterrupt):
+            print("\nStopped.")
+            return 1
     if args.stations:
         for line, line_name in LINES.items():
             print(line_name + ":", ", ".join(f"{name} ({code})" for code, (name, ln) in STATIONS.items() if ln == line))
