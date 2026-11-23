@@ -31,6 +31,7 @@
 ## Features
 
 - Watches one day and one trip between any 2 stations on the same line.
+- Shows the free seats of each class, for example "Business 1".
 - Puts a **sky-blue dot** on the icon when seats are free.
 - Shows a desktop notification with a sound. You can turn it off.
 - Sends an alert to your phone with the free **ntfy** app. This is optional.
@@ -74,7 +75,7 @@ wget -qO- https://raw.githubusercontent.com/abdulrahman-se/saudi-ticket-alert/ma
 The script does these steps:
 
 1. It finds your Linux: Fedora, Ubuntu, Debian, Arch, and Linux that comes from them (Linux Mint, Pop!_OS, Manjaro and more).
-2. It checks Python, the GTK parts, Chrome or Chromium, and the top-bar icon support.
+2. It checks Python, the GTK parts and the top-bar icon support. It needs no browser.
 3. It shows what is missing. It asks you before it uses `sudo`.
 4. It installs SAR Watch for your user only.
 
@@ -101,25 +102,24 @@ Ubuntu:
 
 ```bash
 sudo apt install git python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7
-sudo snap install chromium
 ```
 
 Debian:
 
 ```bash
-sudo apt install git python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 chromium
+sudo apt install git python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7
 ```
 
 Fedora:
 
 ```bash
-sudo dnf install git python3-gobject gobject-introspection gtk3 libayatana-appindicator-gtk3 libnotify chromium
+sudo dnf install git python3-gobject gobject-introspection gtk3 libayatana-appindicator-gtk3 libnotify
 ```
 
 Arch:
 
 ```bash
-sudo pacman -S git python-gobject gtk3 libayatana-appindicator libnotify chromium
+sudo pacman -S git python-gobject gtk3 libayatana-appindicator libnotify
 ```
 
 **2. Get the app and install it.**
@@ -210,8 +210,8 @@ On a server, the update restarts the background service.
 
 ## How it works
 
-1. It opens the public SAR page in a hidden Chrome or Chromium.
-2. It reads the train list. A train with a "waiting list" box is full.
+1. SAR sells the North and East trains in the **Masi** app ([masiapp.com](https://masiapp.com/)). SAR Watch asks the Masi trip search for your day and route. This is the same open search that the Masi website uses.
+2. It reads the free seats of each train and class. A train with 0 seats is full.
 3. It waits about 60 seconds, plus or minus a random 20 %.
 4. It checks again.
 5. After an error, it waits longer: 2, 4, 8, then 15 minutes at most.
@@ -220,9 +220,9 @@ On a server, the update restarts the background service.
 
 ## Safety
 
-- It reads only the public SAR page. It does not log in. It does not book.
-- It does not use SAR's private API. It does not go around any security.
-- It checks slowly: one check per minute or less.
+- It sends one small request per check. It does not log in, it uses no token and it does not book.
+- It does not act as a browser and it does not go around any security. It tells Masi its name: `sar-watch`.
+- It checks slowly: one check per minute or less. After an error, it waits longer.
 - It opens no ports. It has no passwords. The server mode runs as your user, not as root.
 - Your settings are private files (mode 600).
 - It sends only the day, the route and the train times to your phone.
@@ -236,8 +236,7 @@ On a server, the update restarts the background service.
 |---|---|
 | Something is missing. | Run `sh install.sh --check`. It shows what is missing. |
 | I cannot see the train icon. | GNOME: install the extension "AppIndicator and KStatusNotifierItem Support". Then log out and log in. |
-| The icon has an orange dot. | The SAR site was slow. Do nothing. SAR Watch tries again. |
-| "Chrome or Chromium not found". | Install Google Chrome or Chromium (see [Install](#install)). |
+| The icon has an orange dot. | Masi was slow or busy. Do nothing. SAR Watch tries again. |
 | No alert on my phone. | Make sure that the computer is on. Use the same topic in ntfy. Click **Send test**. |
 | I still see the old window after an update. | Click **Quit** in the menu. Open SAR Watch again. |
 
@@ -266,7 +265,7 @@ It shows the files first. Then it asks you.
 
 ## Disclaimer
 
-SAR Watch is an independent, free and open-source project. Saudi Arabia Railways (SAR) did not make it and does not support it. "SAR" is the name of Saudi Arabia Railways. SAR Watch uses only the public SAR website.
+SAR Watch is an independent, free and open-source project. Saudi Arabia Railways (SAR) did not make it and does not support it. "SAR" is the name of Saudi Arabia Railways. SAR now sells the North and East trains in the Masi app. SAR Watch reads the open Masi trip search, slowly. The Masi terms do not allow bots. You use SAR Watch at your own risk.
 
 ## License
 

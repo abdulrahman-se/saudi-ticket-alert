@@ -4,11 +4,12 @@
 Unofficial. Not affiliated with Saudi Arabia Railways (SAR).
 
 How it works
-  * It opens the public SAR "select trip" page in a hidden Chrome or Chromium
-    (own profile, sandbox on) and reads which trains are full.
-    It uses the same page you open by hand. No private API, no login, no booking.
+  * SAR sells the North and East trains in the Masi app (masiapp.com).
+    SAR Watch asks the open Masi trip search (the same search the Masi website
+    uses) for one day and one route, and reads the free seats of each class.
+    No login, no token, no booking, no browser.
   * It checks slowly: 60 s minimum, a random +-20 % gap, and longer waits
-    after errors. It skips images, fonts, maps and chat scripts.
+    after errors (2, 4, 8, then 15 minutes).
 Security
   * It runs as your user. No root, no open ports, no passwords, no shell.
   * The settings files are private (mode 600). The URL uses fixed parts only.
@@ -50,7 +51,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlencode
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 APP_ID = "sar-watch"
 APP_NAME = "SAR Watch"
 _HOME = os.path.expanduser("~")
@@ -59,8 +60,8 @@ CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or _HOME + "/.config",
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or _HOME + "/.cache", APP_ID)
 CONF_FILE = os.path.join(CONF_DIR, "config.json")
 TOPIC_FILE = os.path.join(CONF_DIR, "ntfy-topic")
-PROFILE_DIR = os.path.join(CACHE_DIR, "chrome")
-SNAP_PROFILE_DIR = os.path.join(_HOME, "snap", "chromium", "common", APP_ID)  # snap Chromium cannot write ~/.cache
+PROFILE_DIR = os.path.join(CACHE_DIR, "chrome")                                # old versions (0.2 and before)
+SNAP_PROFILE_DIR = os.path.join(_HOME, "snap", "chromium", "common", APP_ID)  # old versions (0.2 and before)
 ICON_DIR = os.path.join(DATA_DIR, "icons")
 APPS_DIR = os.path.join(_HOME, ".local", "share", "applications")
 AUTOSTART_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or _HOME + "/.config", "autostart")
@@ -77,7 +78,8 @@ MIN_INTERVAL = 60      # seconds between checks (lowest allowed)
 MAX_INTERVAL = 3600
 DEFAULT_INTERVAL = 60
 MAX_BACKOFF = 900      # after errors, wait up to 15 min
-CHECK_TIMEOUT = 90     # kill the browser if one check takes longer
+HTTP_TIMEOUT = 30      # seconds for one request
+MAX_ANSWER_BYTES = 2_000_000
 
 LINES = {"N": "North Line", "E": "East Line"}
 # All SAR passenger stations, checked on tickets.sar.com.sa (Nov 2026).
@@ -181,22 +183,27 @@ def route_label(route):
     return f"{STATIONS[dep][0]} → {STATIONS[arr][0]}"
 
 
-def build_url(route, date):
+MASI_SEARCH = "https://api.masiapp.com/api/trpc/journey.search"
+BOOKING_URL = "https://masiapp.com/"
+SAUDI_TIME = dt.timezone(dt.timedelta(hours=3))
+
+
+def search_url(route, date):
+    """The Masi trip search for one day and one route. Fixed parts only."""
     dep, arr = split_route(route)
-    query = {
-        "ArrivalStation": arr, "DepartureStation": dep,
-        "DepartureDateString": date.isoformat(),
-        "ArrivalDateString": (date + dt.timedelta(days=7)).isoformat(),
-        "AdultCount": 1, "ChildCount": 0, "InfantCount": 0, "DisabledCount": 0,
-        "CarerCount": 0, "passengersCount": 1, "Lang": "ar", "serviceType": 1,
-        "WithCarCargo": "false", "TripDirection": "N", "PromoCode": "undefined",
-    }
-    return "https://tickets.sar.com.sa/select-trip?" + urlencode(query)
+    query = {"origin": dep, "destination": arr, "departureDate": date.isoformat(),
+             "includeFareTiers": True, "passengers": {"adults": 1}}
+    return MASI_SEARCH + "?" + urlencode({"input": json.dumps(query, separators=(",", ":"))})
+
+
+def seats_text(trip):
+    return ", ".join(f"{kind.capitalize()} {n}" for kind, n in (trip.get("seats") or {}).items())
 
 
 def alert_text(cfg, trips):
     return (f"{route_label(cfg['route'])} · {cfg['date']:%a %d %b}\n"
-            "Trains: " + ", ".join(f"{t['dep']} → {t['arr']}" for t in trips))
+            "Trains: " + "; ".join(f"{t['dep']} → {t['arr']}" + (f" ({seats_text(t)})" if t.get("seats") else "")
+                                   for t in trips))
 
 
 def next_delay(interval, errors, rand=random.uniform):
@@ -258,120 +265,75 @@ class CheckError(Exception):
     pass
 
 
-CHROME_NAMES = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser")
-# Third-party files the trip list does not need: maps, chat bot, tracker, icon font, web fonts.
-SKIP_HOSTS = ("maps.googleapis.com", "*.labibabot.com", "cdn.appdynamics.com",
-              "unpkg.com", "fonts.googleapis.com", "fonts.gstatic.com")
-
-_proc_lock = threading.Lock()
-_proc = None
-
-
-def find_browser():
-    """Return (browser path, profile dir). SAR_WATCH_BROWSER can name another Chromium-based browser."""
-    custom = os.environ.get("SAR_WATCH_BROWSER")
-    names = (custom,) if custom else CHROME_NAMES
-    path = next((p for p in map(shutil.which, names) if p), None)
-    if not path:
-        raise CheckError("Chrome or Chromium not found. Install one of them.")
-    is_snap = os.path.realpath(path).startswith("/snap/") or path.startswith("/snap/")
-    return path, (SNAP_PROFILE_DIR if is_snap else PROFILE_DIR)
-
-
-def _kill_group(p):
+def fetch_search(route, date):
+    """Ask the Masi trip search. Returns the JSON answer. Raises CheckError."""
+    req = urllib.request.Request(search_url(route, date), headers={
+        "Accept": "application/json", "x-api-version": "1",
+        "User-Agent": f"sar-watch/{__version__} (+https://github.com/{UPDATE_REPO})"})
     try:
-        os.killpg(p.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:  # nosec B310  # noqa: S310 - fixed https URL
+            data = resp.read(MAX_ANSWER_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        raise CheckError("Masi asks to wait (HTTP 429)" if e.code == 429 else f"Masi answered HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:          # also timeouts
+        raise CheckError(f"No connection to Masi ({getattr(e, 'reason', e)})") from None
+    if len(data) > MAX_ANSWER_BYTES:
+        raise CheckError("The Masi answer is too big")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise CheckError("The Masi answer is not JSON") from None
+
+
+def _saudi_time(text):
+    return dt.datetime.fromisoformat(str(text).replace("Z", "+00:00")).astimezone(SAUDI_TIME).strftime("%H:%M")
+
+
+def parse_journeys(answer):
+    """Masi answer -> trips, sorted by time. [] = no trains on this day. Raises CheckError."""
+    try:
+        journeys = answer["result"]["data"]["journeys"]
+        if not isinstance(journeys, list):
+            raise TypeError("journeys")
+        trips = []
+        for j in journeys:
+            seats = {}
+            if str(j.get("status", "")).lower() not in ("cancelled", "canceled"):
+                for c in j.get("classAvailability") or []:
+                    n = c.get("availableSeats")
+                    if isinstance(n, int) and not isinstance(n, bool) and n > 0 and c.get("status") != "soldout":
+                        kind = str(c.get("type") or "seat")
+                        seats[kind] = seats.get(kind, 0) + n
+            trips.append({"dep": _saudi_time(j["departureTime"]), "arr": _saudi_time(j["arrivalTime"]),
+                          "train": str(j.get("trainNumber") or "?"), "available": bool(seats), "seats": seats})
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise CheckError("Masi sent an answer that SAR Watch does not know (the site may have changed)") from None
+    return sorted(trips, key=lambda t: t["dep"])
+
+
+def _save_failed_answer(answer):
+    """Keep the last answer that did not parse, for diagnosis (one file, overwritten)."""
+    try:
+        _write_private(os.path.join(CACHE_DIR, "last-error.json"), json.dumps(answer, ensure_ascii=False)[:200_000])
+    except (OSError, TypeError, ValueError):
         pass
 
 
-def stop_running_check():
-    with _proc_lock:
-        if _proc is not None:
-            _kill_group(_proc)
-
-
-def reset_browser_data():
+def remove_old_browser_data():
+    """Version 0.2 and before used Chrome. Its data is not needed now."""
     for d in (PROFILE_DIR, SNAP_PROFILE_DIR):
         shutil.rmtree(d, ignore_errors=True)
 
 
-def fetch_dom(url):
-    global _proc
-    browser, profile = find_browser()
-    os.makedirs(profile, mode=0o700, exist_ok=True)
-    rules = ", ".join(f"MAP {h} ~NOTFOUND" for h in SKIP_HOSTS)
-    cmd = [
-        browser, "--headless=new", "--disable-gpu", "--no-first-run",
-        "--no-default-browser-check", "--disable-extensions", "--disable-sync",
-        "--disable-background-networking", "--disable-component-update",
-        "--disable-default-apps", "--mute-audio", "--blink-settings=imagesEnabled=false",
-        "--disk-cache-size=33554432", f"--host-resolver-rules={rules}",
-        f"--user-data-dir={profile}", "--virtual-time-budget=25000", "--dump-dom", url,
-    ]
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,  # nosec B603
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-    with _proc_lock:
-        _proc = p
-    try:
-        out, _ = p.communicate(timeout=CHECK_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        _kill_group(p)
-        p.communicate()
-        raise CheckError("Site too slow (timed out)") from None
-    finally:
-        _kill_group(p)  # make sure no browser helper stays behind
-        with _proc_lock:
-            _proc = None
-    return out.decode("utf-8", "replace")
-
-
-TRIP_RE = re.compile(r"<single-trip\b[^>]*>(.*?)</single-trip>", re.S)
-DEP_RE = re.compile(r'class="(?:[^"]*\s)?from(?:\s[^"]*)?"[^>]*>\s*<h5[^>]*>\s*(\d{1,2}):(\d{2})')
-ARR_RE = re.compile(r'class="(?:[^"]*\s)?to(?:\s[^"]*)?"[^>]*>\s*<h5[^>]*>\s*(\d{1,2}):(\d{2})')
-NUM_RE = re.compile(r"(?:قطار رقم|Train No\.?)\s*(\d+)")
-
-
-def parse_trips(html):
-    """Return a list of trips. [] = no trains for this day. Raises if the page did not load."""
-    trips = []
-    for seg in TRIP_RE.findall(html):
-        dep, arr, num = DEP_RE.search(seg), ARR_RE.search(seg), NUM_RE.search(seg)
-        if not dep:
-            continue
-        trips.append({
-            "dep": f"{int(dep.group(1)):02d}:{dep.group(2)}",
-            "arr": f"{int(arr.group(1)):02d}:{arr.group(2)}" if arr else "?",
-            "train": num.group(1) if num else "?",
-            # The site shows a "waiting list" box only on fully booked trains (trip.fullyBooked).
-            "available": "<waiting-list-widget" not in seg,
-        })
-    if trips:
-        return trips
-    if "<no-trips-found" in html:
-        return []
-    raise CheckError("Page did not load (site busy or changed)")
-
-
-def _save_failed_page(html):
-    """Keep the last page that did not parse, for diagnosis (one file, overwritten)."""
-    try:
-        _write_private(os.path.join(CACHE_DIR, "last-error.html"),
-                       f"<!-- {dt.datetime.now():%Y-%m-%d %H:%M:%S} -->\n{html}")
-    except OSError:
-        pass
-
-
 def check(route, date):
-    html = ""
+    answer = None
     try:
-        html = fetch_dom(build_url(route, date))
-        trips = parse_trips(html)
-        return {"ok": True, "trips": trips, "error": "", "at": dt.datetime.now()}
+        answer = fetch_search(route, date)
+        return {"ok": True, "trips": parse_journeys(answer), "error": "", "at": dt.datetime.now()}
     except CheckError as e:
         err = str(e)
-        if html:
-            _save_failed_page(html)
+        if answer is not None:
+            _save_failed_answer(answer)
     except Exception as e:  # never crash the app on a bad check
         err = f"{type(e).__name__}: {e}"
     return {"ok": False, "trips": [], "error": err, "at": dt.datetime.now()}
@@ -490,6 +452,7 @@ def install():
     if os.path.realpath(target) != SCRIPT:
         shutil.copyfile(SCRIPT, target)
     os.chmod(target, 0o700)   # only you can read or run it
+    remove_old_browser_data()
     ensure_icons()
     entry = (
         "[Desktop Entry]\nType=Application\nName=SAR Watch\n"
@@ -558,7 +521,7 @@ def run_once(date_text, route):
         print("No trains open for this day yet.")
         return 1
     for t in res["trips"]:
-        print(f"  {t['dep']} → {t['arr']}  train {t['train']:>3}  {'SEATS' if t['available'] else 'full'}")
+        print(f"  {t['dep']} → {t['arr']}  train {t['train']:>3}  " + (f"SEATS ({seats_text(t)})" if t["available"] else "full"))
     return 0 if any(t["available"] for t in res["trips"]) else 1
 
 # --------------------------------------------------------------------------- server (no desktop, for SSH)
@@ -608,7 +571,7 @@ def trips_line(trips, times):
     mine = [t for t in trips if not times or t["dep"] in times]
     if not mine:
         return f"No train at {', '.join(times)} on this day."
-    return " · ".join(f"{t['dep']} {'SEATS' if t['available'] else 'full'}" for t in mine)
+    return " · ".join(f"{t['dep']} " + (f"SEATS ({seats_text(t)})" if t["available"] else "full") for t in mine)
 
 
 def _state_file():
@@ -618,6 +581,7 @@ def _state_file():
 def run_headless(max_checks=None, sleep=time.sleep):
     """Watch with no desktop. One log line per check. Alerts go to the phone (ntfy)."""
     log(f"SAR Watch {__version__} started (no desktop).")
+    remove_old_browser_data()
     key, alerted, errors, told, checks = None, set(), 0, None, 0
     while max_checks is None or checks < max_checks:
         cfg = load_config()                     # read every time, so 'sar-watch --setup' changes apply
@@ -646,16 +610,13 @@ def run_headless(max_checks=None, sleep=time.sleep):
             new = [t for t in got if t["dep"] not in alerted]
             alerted = {t["dep"] for t in got}
             if new and cfg["phone"]:
-                err = send_phone("🚆 SAR: seats available!", alert_text(cfg, new),
-                                 build_url(cfg["route"], cfg["date"]))
+                err = send_phone("🚆 SAR: seats available!", alert_text(cfg, new), BOOKING_URL)
                 if err:
                     alerted -= {t["dep"] for t in new}      # try again at the next check
                 text += " · phone alert " + (f"FAILED ({err})" if err else "sent")
         else:
             errors += 1
             text = "Check failed: " + res["error"]
-            if errors == 2:   # stale browser data can break the page; start fresh
-                reset_browser_data()
         log(text)
         _write_private(_state_file(), json.dumps(
             {"at": res["at"].isoformat(timespec="seconds"), "text": text}))
@@ -1046,11 +1007,9 @@ class Tray:
                 if new and self.cfg["phone"]:
                     threading.Thread(target=send_phone, daemon=True, args=(
                         "🚆 SAR: seats available!", alert_text(self.cfg, new),
-                        build_url(self.cfg["route"], self.cfg["date"]))).start()
+                        BOOKING_URL)).start()
             else:
                 self.errors += 1
-                if self.errors == 2:   # stale browser data can break the page; start fresh
-                    reset_browser_data()
         self.schedule()
         return False
 
@@ -1085,7 +1044,7 @@ class Tray:
 
     def open_site(self):
         try:
-            Gio.AppInfo.launch_default_for_uri(build_url(self.cfg["route"], self.cfg["date"]), None)
+            Gio.AppInfo.launch_default_for_uri(BOOKING_URL, None)
         except GLib.Error:
             pass
 
@@ -1325,13 +1284,11 @@ class Tray:
         args = [sys.executable, "-I", installed_path()] + (["--watch"] if self.watching else [])
         self.watching = False
         self.cancel_timer()
-        stop_running_check()
         os.execv(sys.executable, args)   # the lock file closes on exec, so the new app can start
 
     def quit(self):
         self.watching = False
         self.cancel_timer()
-        stop_running_check()
         if self.note:
             try:
                 self.note.close()
@@ -1357,6 +1314,7 @@ def run_gui(selftest=False, watch=False):
         return 0
 
     ensure_icons()
+    remove_old_browser_data()
 
     tray = Tray()
     if watch:                        # after an update: keep watching
@@ -1471,7 +1429,7 @@ def main():
                 return service(args.service)
             if args.status:
                 return status()
-            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # stop cleanly; the browser closes too
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # stop cleanly
             return run_headless(max_checks=args.checks)
         except (EOFError, KeyboardInterrupt):
             print("\nStopped.")

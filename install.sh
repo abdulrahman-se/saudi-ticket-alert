@@ -15,8 +15,8 @@
 #
 # What it does
 #   1. It finds your Linux and its package manager (dnf, apt or pacman).
-#   2. It checks Python 3.11+, the GTK parts for Python, Chrome or Chromium,
-#      and the top-bar icon extension on GNOME.
+#   2. It checks Python 3.11+, the GTK parts for Python, and the top-bar icon
+#      extension on GNOME. (A server needs only Python. No browser is needed.)
 #   3. It shows the commands for the missing parts and asks you before it uses sudo.
 #      It uses only the package repositories of your Linux. It adds no repositories and no keys.
 #   4. It gets sar_watch.py (from this folder, or from GitHub over HTTPS), checks the file,
@@ -34,7 +34,6 @@ APP_URL="https://raw.githubusercontent.com/abdulrahman-se/saudi-ticket-alert/mai
 EXT_UUID="appindicatorsupport@rgcjonas.gmail.com"
 UBUNTU_EXT_UUID="ubuntu-appindicators@ubuntu.com"
 EXT_NAME="AppIndicator and KStatusNotifierItem Support"
-BROWSERS="google-chrome-stable google-chrome chromium chromium-browser"
 
 PY_VERSION='import sys; print("%d.%d" % sys.version_info[:2]); sys.exit(sys.version_info < (3, 11))'
 
@@ -62,16 +61,24 @@ print(", ".join(missing))
 
 # Gets sar_watch.py (HTTPS URL or local file), checks it, saves it (mode 600), prints its version.
 PY_FETCH='
-import os, re, sys, urllib.request
+import os, re, sys, time, urllib.request
 src, out = sys.argv[1], sys.argv[2]
 limit = 1000000
+def download(url):
+    for attempt in range(3):                    # 3 tries: a short network problem does not stop the install
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "sar-watch-installer"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if not r.geturl().startswith("https://"):
+                    raise ValueError("the download left HTTPS")
+                return r.read(limit + 1)
+        except OSError:                         # no connection, timeout, HTTP error
+            if attempt == 2:
+                raise
+            time.sleep(3)
 try:
     if src.startswith("https://"):
-        req = urllib.request.Request(src, headers={"User-Agent": "sar-watch-installer"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            if not r.geturl().startswith("https://"):
-                raise ValueError("the download left HTTPS")
-            data = r.read(limit + 1)
+        data = download(src)
     else:
         with open(src, "rb") as f:
             data = f.read(limit + 1)
@@ -197,7 +204,7 @@ detect_os() {
 }
 
 check_all() {
-  PY_VER='' PY_OK=0 GTK_MISSING='' BROWSER='' EXT_STATE=na
+  PY_VER='' PY_OK=0 GTK_MISSING='' EXT_STATE=na
   if have python3; then
     if PY_VER=$(python3 -I -c "$PY_VERSION" 2>/dev/null); then PY_OK=1; fi
   fi
@@ -208,9 +215,6 @@ check_all() {
   else
     GTK_MISSING="needs Python first"
   fi
-  for b in ${SAR_WATCH_BROWSER-} $BROWSERS; do
-    if have "$b"; then BROWSER=$b; break; fi
-  done
   [ "$SERVER" != 1 ] || return 0
   case ":${XDG_CURRENT_DESKTOP-}:" in
     *GNOME*)
@@ -238,7 +242,6 @@ show_checks() {
   if [ "$SERVER" = 1 ]; then skip "GTK parts and top-bar icon: not needed on a server"
   elif [ -z "$GTK_MISSING" ]; then ok "GTK 3, AppIndicator and libnotify for Python"
   else need "GTK 3, AppIndicator and libnotify for Python ($GTK_MISSING)"; fi
-  if [ -n "$BROWSER" ]; then ok "Browser: $BROWSER"; else need "Chrome or Chromium"; fi
   case $EXT_STATE in
     on)      ok "Top-bar icon: GNOME extension is on" ;;
     off)     need "Top-bar icon: turn on the GNOME extension \"$EXT_NAME\"" ;;
@@ -248,9 +251,9 @@ show_checks() {
   say ""
 }
 
-# Sets PKGS (sudo packages), BROWSER_VIA (pm, snap or empty) and EXT_ENABLE.
+# Sets PKGS (sudo packages) and EXT_ENABLE.
 plan() {
-  PKGS='' BROWSER_VIA='' EXT_ENABLE=0 CANNOT=''
+  PKGS='' EXT_ENABLE=0 CANNOT=''
   if [ "$PY_OK" != 1 ]; then PKGS=$PY_PKG; fi
   if [ -n "$GTK_MISSING" ]; then PKGS="$PKGS $GTK_PKGS"; fi
   if [ -z "$PM" ] && [ -n "$PKGS" ]; then
@@ -259,33 +262,19 @@ plan() {
   fi
   if [ "$EXT_STATE" = missing ] && [ -n "$PM" ]; then PKGS="$PKGS gnome-shell-extension-appindicator"; fi
   if [ "$EXT_STATE" = missing ] || [ "$EXT_STATE" = off ]; then EXT_ENABLE=1; fi
-  if [ -z "$BROWSER" ]; then
-    case $PM in
-      dnf|pacman) BROWSER_VIA=pm ;;
-      rpm-ostree) PKGS="$PKGS chromium" ;;
-      apt)
-        if [ "$OS_ID" != ubuntu ] && apt-cache show chromium >/dev/null 2>&1; then BROWSER_VIA=pm
-        elif have snap; then BROWSER_VIA=snap; fi ;;
-    esac
-  fi
   PKGS=${PKGS# }
 }
 
-# Shows or runs the sudo commands. The browser has its own command, so a browser problem
-# does not stop the other parts.
+# Shows or runs the sudo commands.
 commands() {
   mode=$1
-  if [ "$PM" = apt ] && { [ -n "$PKGS" ] || [ "$BROWSER_VIA" = pm ]; }; then
+  if [ "$PM" = apt ] && [ -n "$PKGS" ]; then
     step "$mode" sudo apt-get update || warn "apt-get update had errors. The script goes on."
   fi
   if [ -n "$PKGS" ]; then
     # shellcheck disable=SC2086 # split the list into package names
     pm_install "$mode" $PKGS || return 1
   fi
-  case $BROWSER_VIA in
-    pm)   pm_install "$mode" chromium || warn "Could not install Chromium." ;;
-    snap) step "$mode" sudo snap install chromium || warn "Could not install Chromium." ;;
-  esac
   return 0
 }
 
@@ -333,9 +322,6 @@ finish_server() {
   cmd="$HOME/.local/bin/sar-watch"
   if have sar-watch; then cmd=sar-watch; fi
   say "${G}Done.${N} SAR Watch is installed for a server (no desktop)."
-  if [ -z "$BROWSER" ]; then
-    warn "No Chrome or Chromium. SAR Watch needs one to check the trains."
-  fi
   if service_active; then
     restart_service
     say "Change the trip: $cmd --setup    Status: $cmd --status"
@@ -386,7 +372,7 @@ main() {
     exit 2
   fi
 
-  if [ -n "$PKGS" ] || [ -n "$BROWSER_VIA" ]; then
+  if [ -n "$PKGS" ]; then
     say "${B}To install the missing parts, it runs:${N}"
     commands show
     if [ "$EXT_ENABLE" = 1 ]; then say "Then it turns on the GNOME extension (no sudo)."; fi
@@ -434,9 +420,6 @@ main() {
   fi
   say "${G}Done.${N} Open \"SAR Watch\" from your app menu. It also starts when you log in."
   if [ "$RELOGIN" = 1 ]; then say "${B}Log out and log in one time.${N} Then the train icon shows in the top bar."; fi
-  if [ -z "$BROWSER" ]; then
-    warn "No Chrome or Chromium. SAR Watch needs one to check the trains. Install Google Chrome: https://www.google.com/chrome/"
-  fi
   if service_active; then
     restart_service
   elif have pgrep && pgrep -u "$(id -u)" -f "sar-watch/sar_watch.py" >/dev/null 2>&1; then
